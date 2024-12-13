@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:flutter_polyline_points/flutter_polyline_points.dart';
@@ -19,60 +20,49 @@ class _RouteMapScreenState extends State<RouteMapScreen> {
   late GoogleMapController mapController;
   final String googleApiKey = "AIzaSyCi5g39Fzethf0tfwn3WesaeRAHOcrGVOQ";
 
-  // List of locations
   final List<LatLng> locations = [
-    const LatLng(9.898527, 76.7001913),
-    const LatLng(9.888103, 76.7046459),
-    const LatLng(9.9097024, 76.6984963),
+    const LatLng(9.956714, 76.2928582),
+    const LatLng(9.6332441, 76.4825775),
+    const LatLng(11.2745235, 75.8362916),
+    const LatLng(9.8426903, 77.3727078),
+    const LatLng(11.0830611, 76.059088),
   ];
 
   Map<MarkerId, Marker> markers = {};
   Map<PolylineId, Polyline> polylines = {};
   List<LatLng> polylineCoordinates = [];
-  List<LatLng> liveRouteCoordinates = []; // For live route
+  List<LatLng> liveRouteCoordinates = [];
   PolylinePoints polylinePoints = PolylinePoints();
+  List<LatLng> optimizedLocations = [];
+  String currentDestinationText = '';
+  double? nextLocationDistance;
 
-  // Driver location tracking
   StreamSubscription<Position>? positionStream;
-  Marker? driverMarker;
   Position? currentPosition;
   Timer? liveRouteTimer;
+  int currentDestinationIndex = 0;
 
   @override
   void initState() {
     super.initState();
     _initializeLocation();
-    _addMarkers();
-    _getRoute();
   }
 
   Future<void> _initializeLocation() async {
-    bool serviceEnabled;
-    LocationPermission permission;
+    bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) return;
 
-    serviceEnabled = await Geolocator.isLocationServiceEnabled();
-    if (!serviceEnabled) {
-      return;
-    }
-
-    permission = await Geolocator.checkPermission();
+    LocationPermission permission = await Geolocator.checkPermission();
     if (permission == LocationPermission.denied) {
       permission = await Geolocator.requestPermission();
-      if (permission == LocationPermission.denied) {
-        return;
-      }
+      if (permission == LocationPermission.denied) return;
     }
+    if (permission == LocationPermission.deniedForever) return;
 
-    if (permission == LocationPermission.deniedForever) {
-      return;
-    }
-
-    // Get initial position
     currentPosition = await Geolocator.getCurrentPosition();
     _updateDriverMarker(currentPosition!);
-    _updateLiveRoute(); // Get initial live route
+    _findNearestLocationAndOptimizeRoute();
 
-    // Start listening to location updates
     positionStream = Geolocator.getPositionStream(
       locationSettings: const LocationSettings(
         accuracy: LocationAccuracy.high,
@@ -82,30 +72,87 @@ class _RouteMapScreenState extends State<RouteMapScreen> {
       setState(() {
         currentPosition = position;
         _updateDriverMarker(position);
-        _updateLiveRoute(); // Update live route when location changes
+        _updateLiveRoute();
+        _updateDistanceToNextLocation();
       });
     });
 
-    // Update live route periodically
     liveRouteTimer = Timer.periodic(const Duration(seconds: 30), (timer) {
       if (currentPosition != null) {
         _updateLiveRoute();
+        _updateDistanceToNextLocation();
       }
     });
   }
 
+  void _findNearestLocationAndOptimizeRoute() {
+    if (currentPosition == null || locations.isEmpty) return;
+
+    List<LatLng> unvisitedLocations = List.from(locations);
+    optimizedLocations = [];
+    LatLng currentLoc =
+        LatLng(currentPosition!.latitude, currentPosition!.longitude);
+
+    while (unvisitedLocations.isNotEmpty) {
+      int nearestIndex = 0;
+      double nearestDistance = double.infinity;
+
+      for (int i = 0; i < unvisitedLocations.length; i++) {
+        double distance = Geolocator.distanceBetween(
+          currentLoc.latitude,
+          currentLoc.longitude,
+          unvisitedLocations[i].latitude,
+          unvisitedLocations[i].longitude,
+        );
+
+        if (distance < nearestDistance) {
+          nearestDistance = distance;
+          nearestIndex = i;
+        }
+      }
+
+      optimizedLocations.add(unvisitedLocations[nearestIndex]);
+      currentLoc = unvisitedLocations[nearestIndex];
+      unvisitedLocations.removeAt(nearestIndex);
+    }
+
+    _addMarkers();
+    _getRoute();
+    _updateLiveRoute();
+  }
+
+  void _updateDistanceToNextLocation() {
+    if (currentPosition == null ||
+        currentDestinationIndex >= optimizedLocations.length) return;
+
+    nextLocationDistance = Geolocator.distanceBetween(
+      currentPosition!.latitude,
+      currentPosition!.longitude,
+      optimizedLocations[currentDestinationIndex].latitude,
+      optimizedLocations[currentDestinationIndex].longitude,
+    );
+
+    setState(() {
+      currentDestinationText =
+          'Next Stop: Location ${currentDestinationIndex + 1}\n'
+          'Distance: ${(nextLocationDistance! / 1000).toStringAsFixed(2)} km';
+    });
+  }
+
   Future<void> _updateLiveRoute() async {
-    if (currentPosition == null) return;
+    if (currentPosition == null || optimizedLocations.isEmpty) return;
 
     liveRouteCoordinates.clear();
 
-    // Get route from current position to first location
     PolylineResult result = await polylinePoints.getRouteBetweenCoordinates(
       googleApiKey: googleApiKey,
       request: PolylineRequest(
         origin:
             PointLatLng(currentPosition!.latitude, currentPosition!.longitude),
-        destination: PointLatLng(locations[0].latitude, locations[0].longitude),
+        destination: PointLatLng(
+          optimizedLocations[currentDestinationIndex].latitude,
+          optimizedLocations[currentDestinationIndex].longitude,
+        ),
         mode: TravelMode.driving,
       ),
     );
@@ -116,13 +163,12 @@ class _RouteMapScreenState extends State<RouteMapScreen> {
       }
     }
 
-    // Add live route polyline
     final PolylineId liveRouteId = PolylineId('live_route');
     final Polyline liveRoute = Polyline(
       polylineId: liveRouteId,
       color: Colors.green,
       points: liveRouteCoordinates,
-      width: 5,
+      width: 15,
     );
 
     setState(() {
@@ -146,26 +192,32 @@ class _RouteMapScreenState extends State<RouteMapScreen> {
   }
 
   void _addMarkers() {
-    for (int i = 0; i < locations.length; i++) {
+    for (int i = 0; i < optimizedLocations.length; i++) {
       final markerId = MarkerId(i.toString());
       final marker = Marker(
         markerId: markerId,
-        position: locations[i],
+        position: optimizedLocations[i],
         icon: BitmapDescriptor.defaultMarker,
-        infoWindow: InfoWindow(title: 'Location ${i + 1}'),
+        infoWindow: InfoWindow(
+          title: 'Location ${i + 1}',
+          snippet: i == currentDestinationIndex ? 'Next Stop' : '',
+        ),
       );
       markers[markerId] = marker;
     }
   }
 
   Future<void> _getRoute() async {
-    for (int i = 0; i < locations.length - 1; i++) {
+    polylineCoordinates.clear();
+
+    for (int i = 0; i < optimizedLocations.length - 1; i++) {
       PolylineResult result = await polylinePoints.getRouteBetweenCoordinates(
         googleApiKey: googleApiKey,
         request: PolylineRequest(
-          origin: PointLatLng(locations[i].latitude, locations[i].longitude),
-          destination: PointLatLng(
-              locations[i + 1].latitude, locations[i + 1].longitude),
+          origin: PointLatLng(
+              optimizedLocations[i].latitude, optimizedLocations[i].longitude),
+          destination: PointLatLng(optimizedLocations[i + 1].latitude,
+              optimizedLocations[i + 1].longitude),
           mode: TravelMode.driving,
         ),
       );
@@ -219,25 +271,49 @@ class _RouteMapScreenState extends State<RouteMapScreen> {
           ),
           IconButton(
             icon: const Icon(Icons.refresh),
-            onPressed: _updateLiveRoute,
+            onPressed: () {
+              _findNearestLocationAndOptimizeRoute();
+            },
           ),
         ],
       ),
-      body: GoogleMap(
-        initialCameraPosition: CameraPosition(
-          target: locations[0],
-          zoom: 13,
-        ),
-        onMapCreated: (GoogleMapController controller) {
-          mapController = controller;
-        },
-        markers: Set<Marker>.of(markers.values),
-        polylines: Set<Polyline>.of(polylines.values),
-        myLocationEnabled: true,
-        myLocationButtonEnabled: true,
-        mapType: MapType.normal,
-        zoomGesturesEnabled: true,
-        zoomControlsEnabled: true,
+      body: Stack(
+        children: [
+          GoogleMap(
+            initialCameraPosition: CameraPosition(
+              target: locations[0],
+              zoom: 13,
+            ),
+            onMapCreated: (GoogleMapController controller) {
+              mapController = controller;
+            },
+            markers: Set<Marker>.of(markers.values),
+            polylines: Set<Polyline>.of(polylines.values),
+            myLocationEnabled: true,
+            myLocationButtonEnabled: true,
+            mapType: MapType.normal,
+            zoomGesturesEnabled: true,
+            zoomControlsEnabled: true,
+          ),
+          if (currentDestinationText.isNotEmpty)
+            Positioned(
+              bottom: 20,
+              left: 20,
+              right: 20,
+              child: Card(
+                color: Colors.white,
+                child: Padding(
+                  padding: const EdgeInsets.all(8.0),
+                  child: Text(
+                    currentDestinationText,
+                    style: const TextStyle(
+                        fontSize: 16, fontWeight: FontWeight.bold),
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+              ),
+            ),
+        ],
       ),
     );
   }
