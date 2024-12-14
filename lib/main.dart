@@ -1,12 +1,138 @@
 import 'dart:async';
-import 'dart:math';
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:flutter_polyline_points/flutter_polyline_points.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:http/http.dart' as http;
 
 void main() {
   runApp(const MaterialApp(home: RouteMapScreen()));
+}
+
+class PlaceSearchResult {
+  final String placeId;
+  final String description;
+  final LatLng? location;
+
+  PlaceSearchResult({
+    required this.placeId,
+    required this.description,
+    this.location,
+  });
+}
+
+class CustomSearchDelegate extends SearchDelegate<PlaceSearchResult?> {
+  final String apiKey;
+  Timer? _debounce;
+
+  CustomSearchDelegate({required this.apiKey});
+
+  Future<List<PlaceSearchResult>> _getPlaceSuggestions(String query) async {
+    if (query.isEmpty) return [];
+
+    final url =
+        Uri.parse('https://maps.googleapis.com/maps/api/place/autocomplete/json'
+            '?input=$query'
+            '&key=$apiKey');
+
+    final response = await http.get(url);
+    final data = json.decode(response.body);
+
+    if (data['status'] == 'OK') {
+      return (data['predictions'] as List).map((prediction) {
+        return PlaceSearchResult(
+          placeId: prediction['place_id'],
+          description: prediction['description'],
+        );
+      }).toList();
+    }
+    return [];
+  }
+
+  Future<LatLng?> _getPlaceDetails(String placeId) async {
+    final url =
+        Uri.parse('https://maps.googleapis.com/maps/api/place/details/json'
+            '?place_id=$placeId'
+            '&fields=geometry'
+            '&key=$apiKey');
+
+    final response = await http.get(url);
+    final data = json.decode(response.body);
+
+    if (data['status'] == 'OK') {
+      final location = data['result']['geometry']['location'];
+      return LatLng(location['lat'], location['lng']);
+    }
+    return null;
+  }
+
+  @override
+  List<Widget> buildActions(BuildContext context) {
+    return [
+      IconButton(
+        icon: const Icon(Icons.clear),
+        onPressed: () {
+          query = '';
+        },
+      ),
+    ];
+  }
+
+  @override
+  Widget buildLeading(BuildContext context) {
+    return IconButton(
+      icon: const Icon(Icons.arrow_back),
+      onPressed: () {
+        close(context, null);
+      },
+    );
+  }
+
+  @override
+  Widget buildResults(BuildContext context) {
+    return Container();
+  }
+
+  @override
+  Widget buildSuggestions(BuildContext context) {
+    if (_debounce?.isActive ?? false) _debounce?.cancel();
+
+    return FutureBuilder<List<PlaceSearchResult>>(
+      future: _getPlaceSuggestions(query),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Center(child: CircularProgressIndicator());
+        }
+
+        if (!snapshot.hasData || snapshot.data!.isEmpty) {
+          return const Center(child: Text('No results found'));
+        }
+
+        return ListView.builder(
+          itemCount: snapshot.data!.length,
+          itemBuilder: (context, index) {
+            final place = snapshot.data![index];
+            return ListTile(
+              title: Text(place.description),
+              onTap: () async {
+                final location = await _getPlaceDetails(place.placeId);
+                if (location != null) {
+                  close(
+                      context,
+                      PlaceSearchResult(
+                        placeId: place.placeId,
+                        description: place.description,
+                        location: location,
+                      ));
+                }
+              },
+            );
+          },
+        );
+      },
+    );
+  }
 }
 
 class RouteMapScreen extends StatefulWidget {
@@ -20,12 +146,10 @@ class _RouteMapScreenState extends State<RouteMapScreen> {
   late GoogleMapController mapController;
   final String googleApiKey = "AIzaSyCi5g39Fzethf0tfwn3WesaeRAHOcrGVOQ";
 
-  final List<LatLng> locations = [
-    const LatLng(9.956714, 76.2928582),
-    const LatLng(9.6332441, 76.4825775),
-    const LatLng(11.2745235, 75.8362916),
-    const LatLng(9.8426903, 77.3727078),
-    const LatLng(11.0830611, 76.059088),
+  List<LatLng> locations = [
+    const LatLng(9.898527, 76.7001913),
+    const LatLng(9.888103, 76.7046459),
+    const LatLng(9.9097024, 76.6984963),
   ];
 
   Map<MarkerId, Marker> markers = {};
@@ -83,6 +207,27 @@ class _RouteMapScreenState extends State<RouteMapScreen> {
         _updateDistanceToNextLocation();
       }
     });
+  }
+
+  void _showPlaceSearch() async {
+    final result = await showSearch<PlaceSearchResult?>(
+      context: context,
+      delegate: CustomSearchDelegate(apiKey: googleApiKey),
+    );
+
+    if (result != null && result.location != null) {
+      setState(() {
+        locations.add(result.location!);
+        _findNearestLocationAndOptimizeRoute();
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Added: ${result.description}'),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+    }
   }
 
   void _findNearestLocationAndOptimizeRoute() {
@@ -168,7 +313,7 @@ class _RouteMapScreenState extends State<RouteMapScreen> {
       polylineId: liveRouteId,
       color: Colors.green,
       points: liveRouteCoordinates,
-      width: 15,
+      width: 5,
     );
 
     setState(() {
@@ -192,6 +337,7 @@ class _RouteMapScreenState extends State<RouteMapScreen> {
   }
 
   void _addMarkers() {
+    markers.clear();
     for (int i = 0; i < optimizedLocations.length; i++) {
       final markerId = MarkerId(i.toString());
       final marker = Marker(
@@ -204,6 +350,10 @@ class _RouteMapScreenState extends State<RouteMapScreen> {
         ),
       );
       markers[markerId] = marker;
+    }
+
+    if (currentPosition != null) {
+      _updateDriverMarker(currentPosition!);
     }
   }
 
@@ -246,6 +396,7 @@ class _RouteMapScreenState extends State<RouteMapScreen> {
   void dispose() {
     positionStream?.cancel();
     liveRouteTimer?.cancel();
+    mapController.dispose();
     super.dispose();
   }
 
@@ -255,6 +406,10 @@ class _RouteMapScreenState extends State<RouteMapScreen> {
       appBar: AppBar(
         title: const Text('Route Map'),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.search),
+            onPressed: _showPlaceSearch,
+          ),
           IconButton(
             icon: const Icon(Icons.my_location),
             onPressed: () {
@@ -304,17 +459,33 @@ class _RouteMapScreenState extends State<RouteMapScreen> {
                 color: Colors.white,
                 child: Padding(
                   padding: const EdgeInsets.all(8.0),
-                  child: Text(
-                    currentDestinationText,
-                    style: const TextStyle(
-                        fontSize: 16, fontWeight: FontWeight.bold),
-                    textAlign: TextAlign.center,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        currentDestinationText,
+                        style: const TextStyle(
+                            fontSize: 16, fontWeight: FontWeight.bold),
+                        textAlign: TextAlign.center,
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        'Total Locations: ${locations.length}',
+                        style: const TextStyle(fontSize: 14),
+                      ),
+                    ],
                   ),
                 ),
               ),
             ),
         ],
       ),
+      floatingActionButton: FloatingActionButton(
+        onPressed: _showPlaceSearch,
+        child: const Icon(Icons.add_location),
+        tooltip: 'Add Location',
+      ),
+      floatingActionButtonLocation: FloatingActionButtonLocation.startFloat,
     );
   }
 }
