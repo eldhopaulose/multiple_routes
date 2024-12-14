@@ -5,6 +5,7 @@ import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:flutter_polyline_points/flutter_polyline_points.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
+import 'package:url_launcher/url_launcher.dart';
 
 void main() {
   runApp(const MaterialApp(home: RouteMapScreen()));
@@ -146,6 +147,8 @@ class _RouteMapScreenState extends State<RouteMapScreen> {
   late GoogleMapController mapController;
   final String googleApiKey = "AIzaSyCi5g39Fzethf0tfwn3WesaeRAHOcrGVOQ";
 
+  Map<LatLng, String> placeNames = {};
+
   List<LatLng> locations = [
     const LatLng(9.898527, 76.7001913),
     const LatLng(9.888103, 76.7046459),
@@ -261,7 +264,7 @@ class _RouteMapScreenState extends State<RouteMapScreen> {
       unvisitedLocations.removeAt(nearestIndex);
     }
 
-    _addMarkers();
+    _addMarkers(context);
     _getRoute();
     _updateLiveRoute();
   }
@@ -314,6 +317,13 @@ class _RouteMapScreenState extends State<RouteMapScreen> {
       color: Colors.green,
       points: liveRouteCoordinates,
       width: 5,
+      startCap: Cap.roundCap,
+      endCap: Cap.roundCap,
+      zIndex: 5,
+      jointType: JointType.round,
+      geodesic: false,
+      patterns: [PatternItem.dash(100), PatternItem.gap(10)],
+      consumeTapEvents: false,
     );
 
     setState(() {
@@ -324,28 +334,80 @@ class _RouteMapScreenState extends State<RouteMapScreen> {
   void _updateDriverMarker(Position position) {
     final MarkerId markerId = const MarkerId('driver');
     final marker = Marker(
-      markerId: markerId,
-      position: LatLng(position.latitude, position.longitude),
-      icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueGreen),
-      infoWindow: const InfoWindow(title: 'Driver Location'),
-      rotation: position.heading,
-    );
+        markerId: markerId,
+        position: LatLng(position.latitude, position.longitude),
+        icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueGreen),
+        infoWindow: const InfoWindow(title: 'Driver Location'),
+        rotation: position.heading,
+        onTap: () {
+          print('Driver Location Tapped');
+        });
 
     setState(() {
       markers[markerId] = marker;
     });
   }
 
-  void _addMarkers() {
+  Future<String> _getPlaceName(LatLng location) async {
+    try {
+      final url = Uri.parse('https://maps.googleapis.com/maps/api/geocode/json?'
+          'latlng=${location.latitude},${location.longitude}'
+          '&key=$googleApiKey');
+
+      final response = await http.get(url);
+      final data = json.decode(response.body);
+
+      if (data['status'] == 'OK') {
+        final results = data['results'];
+        if (results.isNotEmpty) {
+          // Try to get a meaningful place name from address components
+          final firstResult = results[0];
+          final addressComponents = firstResult['address_components'];
+
+          // Look for establishment name or street name first
+          for (var component in addressComponents) {
+            final types = component['types'] as List;
+            if (types.contains('establishment') ||
+                types.contains('route') ||
+                types.contains('sublocality_level_1')) {
+              return component['long_name'];
+            }
+          }
+
+          // Fall back to formatted address if no specific component found
+          return firstResult['formatted_address'].toString().split(',')[0];
+        }
+      }
+      return 'Location ${locations.indexOf(location) + 1}';
+    } catch (e) {
+      print('Error getting place name: $e');
+      return 'Location ${locations.indexOf(location) + 1}';
+    }
+  }
+
+  Future<void> _addMarkers(BuildContext context) async {
     markers.clear();
     for (int i = 0; i < optimizedLocations.length; i++) {
+      final location = optimizedLocations[i];
+
+      // Get place name if not already cached
+      if (!placeNames.containsKey(location)) {
+        placeNames[location] = await _getPlaceName(location);
+      }
       final markerId = MarkerId(i.toString());
       final marker = Marker(
         markerId: markerId,
         position: optimizedLocations[i],
         icon: BitmapDescriptor.defaultMarker,
+        zIndex: 0,
+        onTap: () => _showDirection(
+          context: context,
+          latitude: optimizedLocations[i].latitude,
+          longitude: optimizedLocations[i].longitude,
+          location: placeNames[location]!,
+        ),
         infoWindow: InfoWindow(
-          title: 'Location ${i + 1}',
+          title: placeNames[location],
           snippet: i == currentDestinationIndex ? 'Next Stop' : '',
         ),
       );
@@ -355,6 +417,70 @@ class _RouteMapScreenState extends State<RouteMapScreen> {
     if (currentPosition != null) {
       _updateDriverMarker(currentPosition!);
     }
+  }
+
+  Future<void> openMap(double latitude, double longitude) async {
+    final Uri _url = Uri.parse(
+        'https://www.google.com/maps/search/?api=1&query=$latitude,$longitude');
+    if (await !await launchUrl(_url)) {
+      print('Could not launch $_url');
+    }
+  }
+
+  _showDirection(
+      {required BuildContext context,
+      required double latitude,
+      required double longitude,
+      required String location}) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(16.0),
+        ),
+        title: Text(
+          'Confirmation',
+          style: TextStyle(fontWeight: FontWeight.bold),
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.info_outline,
+              size: 60,
+              color: Colors.blue,
+            ),
+            SizedBox(height: 10),
+            Text(
+              'Are you sure you want to proceed to this location $location?',
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 16),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.of(context).pop(false);
+            },
+            child: Text(
+              'Cancel',
+              style: TextStyle(color: Colors.red),
+            ),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              openMap(latitude, longitude);
+              // Add your action here
+            },
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.green,
+            ),
+            child: Text('Proceed'),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _getRoute() async {
